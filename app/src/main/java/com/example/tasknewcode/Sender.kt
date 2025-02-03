@@ -84,11 +84,9 @@ class Sender(private val context: Context) {
 
                 println("Sending file: $fileName (Size: $fileSize bytes)")
 
-                // Send file header: TYPE:FILE_NAME:FILE_SIZE
                 val header = "$MESSAGE_TYPE_FILE:$fileName:$fileSize$HEADER_END"
                 outputStream?.write(header.toByteArray())
 
-                // Send file content
                 val buffer = ByteArray(BUFFER_SIZE)
                 var bytesRead = 0
                 var totalSent = 0L
@@ -97,7 +95,6 @@ class Sender(private val context: Context) {
                     outputStream?.write(buffer, 0, bytesRead)
                     totalSent += bytesRead
 
-                    // Send progress update
                     val progress = (totalSent * 100 / fileSize).toInt()
                     val progressIntent = Intent("com.example.tasknewcode.PROGRESS_UPDATE")
                     progressIntent.putExtra("progress", progress)

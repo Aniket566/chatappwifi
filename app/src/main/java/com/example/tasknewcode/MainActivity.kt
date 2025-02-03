@@ -84,7 +84,6 @@ class MainActivity : AppCompatActivity() {
         println("Checking permissions...")
         val permissions = mutableListOf<String>()
 
-        // Network permissions
         if (ContextCompat.checkSelfPermission(this, android.Manifest.permission.INTERNET)
             != PackageManager.PERMISSION_GRANTED) {
             permissions.add(android.Manifest.permission.INTERNET)
@@ -98,7 +97,6 @@ class MainActivity : AppCompatActivity() {
             permissions.add(android.Manifest.permission.ACCESS_WIFI_STATE)
         }
 
-        // Storage permissions
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) {
             if (ContextCompat.checkSelfPermission(this, android.Manifest.permission.READ_EXTERNAL_STORAGE)
                 != PackageManager.PERMISSION_GRANTED) {

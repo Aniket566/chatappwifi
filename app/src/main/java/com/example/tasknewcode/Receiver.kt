@@ -103,7 +103,6 @@ class Receiver(private val context: Context) {
         println("Stopping server...")
         isListening = false
 
-        // Close all active clients
         activeClients.forEach { socket ->
             try {
                 socket.close()
