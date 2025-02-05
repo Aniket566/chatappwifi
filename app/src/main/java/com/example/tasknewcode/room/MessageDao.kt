@@ -13,4 +13,7 @@ interface MessageDao {
 
     @Query("SELECT * FROM messages ORDER BY timestamp ASC")
     suspend fun getAllMessages(): List<ChatMessage>
+
+    @Query("SELECT * FROM messages WHERE text = :content LIMIT 1")
+    suspend fun getMessageByContent(content: String): ChatMessage?
 }

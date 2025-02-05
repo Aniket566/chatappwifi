@@ -9,6 +9,7 @@ import android.view.ViewGroup
 import android.widget.ImageView
 import android.widget.TextView
 import androidx.core.content.FileProvider
+import androidx.core.view.isVisible
 import androidx.recyclerview.widget.RecyclerView
 import com.bumptech.glide.Glide
 import java.io.File
@@ -24,45 +25,49 @@ class MessageAdapter(private val context: Context, private val messages: List<Ch
     override fun onBindViewHolder(holder: MessageViewHolder, position: Int) {
         val message = messages[position]
 
-        if (message.isSender) {
-            holder.senderText.text = message.text
-            holder.senderContainer.visibility = View.VISIBLE
-            holder.receiverContainer.visibility = View.GONE
-        } else {
-            holder.receiverText.text = message.text
-            holder.senderContainer.visibility = View.GONE
-            holder.receiverContainer.visibility = View.VISIBLE
-        }
+        holder.apply {
+            senderContainer.isVisible = message.isSender
+            receiverContainer.isVisible = !message.isSender
+            imagePreview.isVisible = false
+            documentPreview.isVisible = false
 
-        if (message.filePath != null) {
-            val file = File(message.filePath)
-            val fileType = file.extension.lowercase()
+            if (message.isSender) {
+                senderText.text = getDisplayText(message)
+            } else {
+                receiverText.text = getDisplayText(message)
+            }
 
-            when (fileType) {
-                "jpg", "jpeg", "png" -> {
-                    holder.imagePreview.visibility = View.VISIBLE
-                    holder.documentPreview.visibility = View.GONE
-                    Glide.with(context).load(file).into(holder.imagePreview)
-                }
-                "pdf", "docx", "txt", "xlsx", "pptx" -> {
-                    holder.imagePreview.visibility = View.GONE
-                    holder.documentPreview.visibility = View.VISIBLE
-                    holder.documentPreview.text = "📄 ${file.name}"
-                    holder.documentPreview.setOnClickListener { openFile(file) }
-                }
-                else -> {
-                    holder.imagePreview.visibility = View.GONE
-                    holder.documentPreview.visibility = View.GONE
+            message.filePath?.let { filePath ->
+                val file = File(filePath)
+                when (getFileType(file)) {
+                    "image" -> {
+                        imagePreview.isVisible = true
+                        Glide.with(context).load(file).into(imagePreview)
+                    }
+                    "document" -> {
+                        documentPreview.isVisible = true
+                        documentPreview.text = "📄 ${file.name}"
+                        documentPreview.setOnClickListener { openFile(file) }
+                    }
                 }
             }
-        } else {
-            holder.imagePreview.visibility = View.GONE
-            holder.documentPreview.visibility = View.GONE
         }
     }
 
+    private fun getDisplayText(message: ChatMessage) = when {
+        message.text.startsWith("📎 Sending file:") -> "File: ${message.text.substring(15)}"
+        message.text.startsWith("📎 Received file:") -> "File: ${message.text.substring(16)}"
+        else -> message.text
+    }
+
+    private fun getFileType(file: File) = when (file.extension.lowercase()) {
+        in setOf("jpg", "jpeg", "png", "gif") -> "image"
+        in setOf("pdf", "docx", "txt", "xlsx", "pptx") -> "document"
+        else -> "unknown"
+    }
+
     private fun openFile(file: File) {
-        val uri: Uri = FileProvider.getUriForFile(context, "com.example.chatapp.provider", file)
+        val uri = FileProvider.getUriForFile(context, "${context.packageName}.provider", file)
         val mimeType = context.contentResolver.getType(uri) ?: "*/*"
 
         val intent = Intent(Intent.ACTION_VIEW).apply {
@@ -71,15 +76,13 @@ class MessageAdapter(private val context: Context, private val messages: List<Ch
         }
 
         try {
-            context.startActivity(Intent.createChooser(intent, "Open file with"))
+            context.startActivity(Intent.createChooser(intent, "Open file"))
         } catch (e: Exception) {
             e.printStackTrace()
         }
     }
 
-
-    override fun getItemCount(): Int = messages.size
-
+    override fun getItemCount() = messages.size
 
     class MessageViewHolder(view: View) : RecyclerView.ViewHolder(view) {
         val senderContainer: View = view.findViewById(R.id.senderContainer)

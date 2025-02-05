@@ -7,10 +7,19 @@
     android:background="?attr/selectableItemBackground">
 
     <TextView
-        android:id="@+id/tvDeviceIp"
-        android:layout_width="match_parent"
+        android:id="@+id/tvDecName"
+        android:layout_width="wrap_content"
         android:layout_height="wrap_content"
-        android:textSize="18sp"
-        android:textColor="@android:color/black"
-        android:padding="8dp" />
+        android:text="Device Name"
+        android:textSize="16sp"
+        android:textStyle="bold" />
+
+    <TextView
+        android:id="@+id/tvDeviceIp"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:text="IP: --"
+        android:textSize="14sp"
+        android:layout_marginTop="4dp"/>
+
 </LinearLayout>

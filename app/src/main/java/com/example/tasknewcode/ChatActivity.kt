@@ -1,32 +1,26 @@
 package com.example.tasknewcode
 
-import android.annotation.SuppressLint
-import android.content.BroadcastReceiver
-import android.content.Context
-import android.content.Intent
-import android.content.IntentFilter
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.provider.OpenableColumns
-import android.widget.Button
+import android.util.Log
 import android.widget.EditText
 import android.widget.ImageButton
 import android.widget.TextView
+import android.widget.Toast
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.annotation.RequiresApi
 import androidx.appcompat.app.AppCompatActivity
+import androidx.lifecycle.lifecycleScope
 import androidx.recyclerview.widget.LinearLayoutManager
 import androidx.recyclerview.widget.RecyclerView
-import androidx.activity.result.contract.ActivityResultContracts
-import androidx.lifecycle.lifecycleScope
 import com.example.tasknewcode.room.ChatDatabase
 import com.example.tasknewcode.room.MessageDao
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.launch
-import kotlinx.coroutines.withContext
+import kotlinx.coroutines.*
 import java.io.File
 
-class ChatActivity : AppCompatActivity() {
+class ChatActivity : AppCompatActivity(), MessageListener {
     private lateinit var recyclerView: RecyclerView
     private lateinit var messageAdapter: MessageAdapter
     private lateinit var etMessage: EditText
@@ -37,35 +31,14 @@ class ChatActivity : AppCompatActivity() {
     private lateinit var messageDao: MessageDao
     private var sender: Sender? = null
     private var receiver: Receiver? = null
-    private var ipAddress: String? = null
+    private var ipAddress: String = "Unknown"
+    private var localIpAddress: String = "Unknown"
+    private var currentFileMessage: ChatMessage? = null
 
-    private val messageReceiver = object : BroadcastReceiver() {
-        override fun onReceive(context: Context?, intent: Intent?) {
-            when (intent?.action) {
-                "com.example.tasknewcode.NEW_MESSAGE" -> {
-                    val message = intent.getStringExtra("message")
-                    if (message != null) {
-                        runOnUiThread {
-                            receiveMessage(message)
-                        }
-                    }
-                }
-                "com.example.tasknewcode.NEW_FILE" -> {
-                    val filePath = intent.getStringExtra("filePath")
-                    if (filePath != null) {
-                        runOnUiThread {
-                            receiveFile(filePath)
-                        }
-                    }
-                }
-                "com.example.tasknewcode.PROGRESS_UPDATE" -> {
-                    val progress = intent.getIntExtra("progress", 0)
-                    runOnUiThread {
-                        updateProgress(progress)
-                    }
-                }
-            }
-        }
+    companion object {
+        private const val TAG = "ChatActivity"
+        private const val CONNECTION_RETRY_DELAY = 3000L
+        private const val MAX_CONNECTION_ATTEMPTS = 3
     }
 
     @RequiresApi(Build.VERSION_CODES.O)
@@ -78,7 +51,6 @@ class ChatActivity : AppCompatActivity() {
         setupRecyclerView()
         setupNetworking()
         setupClickListeners()
-        registerReceivers()
         loadPreviousMessages()
     }
 
@@ -88,12 +60,12 @@ class ChatActivity : AppCompatActivity() {
         etMessage = findViewById(R.id.etMessage)
         btnSendFile = findViewById(R.id.btnSendFile)
 
-        ipAddress = intent.getStringExtra("ip_address") ?: "Unknown IP"
+        ipAddress = intent.getStringExtra("IP_ADDRESS") ?: "Unknown"
         tvIp.text = "Chat with: $ipAddress"
     }
 
     private fun setupDatabase() {
-        database = ChatDatabase.getDatabase(this@ChatActivity)
+        database = ChatDatabase.getDatabase(this)
         messageDao = database.messageDao()
     }
 
@@ -102,29 +74,62 @@ class ChatActivity : AppCompatActivity() {
         recyclerView.apply {
             layoutManager = LinearLayoutManager(this@ChatActivity)
             adapter = messageAdapter
-            addOnLayoutChangeListener { _, _, _, _, bottom, _, _, _, oldBottom ->
-                if (bottom < oldBottom) {
-                    recyclerView.postDelayed({
-                        recyclerView.scrollToPosition(messages.size - 1)
-                    }, 100)
-                }
-            }
         }
     }
 
     private fun setupNetworking() {
-        println("Setting up networking with IP: $ipAddress")
-        receiver = Receiver(this).apply {
-            println("Starting receiver...")
-            startListening(9999)
-        }
-        
-        sender = Sender(this).apply {
-            ipAddress?.let { ip ->
-                println("Connecting sender to $ip")
-                connect(ip, 9999)
+        receiver = Receiver(this, this)
+        localIpAddress = receiver?.getLocalIpAddress() ?: "Unknown"
+        Log.d(TAG, "Local IP: $localIpAddress")
+
+        receiver?.startListening()
+        connectSender()
+    }
+
+    private fun connectSender(attempts: Int = 0) {
+        if (sender != null) return
+
+        sender = Sender(this)
+        sender?.connect(ipAddress, object : Sender.TransferCallback {
+            override fun onProgress(progress: Int, speed: Long, bufferUsed: Int) {
+
             }
-        }
+
+            override fun onComplete(success: Boolean) {
+                runOnUiThread {
+                    if (success) {
+                        Toast.makeText(
+                            this@ChatActivity,
+                            "Connected to $ipAddress",
+                            Toast.LENGTH_SHORT
+                        ).show()
+                    } else {
+                        if (attempts < MAX_CONNECTION_ATTEMPTS) {
+                            lifecycleScope.launch {
+                                delay(CONNECTION_RETRY_DELAY)
+                                connectSender(attempts + 1)
+                            }
+                        } else {
+                            Toast.makeText(
+                                this@ChatActivity,
+                                "Failed to connect after multiple attempts",
+                                Toast.LENGTH_LONG
+                            ).show()
+                        }
+                    }
+                }
+            }
+
+            override fun onError(message: String) {
+                runOnUiThread {
+                    Toast.makeText(
+                        this@ChatActivity,
+                        message,
+                        Toast.LENGTH_SHORT
+                    ).show()
+                }
+            }
+        })
     }
 
     private fun setupClickListeners() {
@@ -141,99 +146,32 @@ class ChatActivity : AppCompatActivity() {
         }
     }
 
-    @SuppressLint("NewApi")
-    private fun registerReceivers() {
-        val intentFilter = IntentFilter().apply {
-            addAction("com.example.tasknewcode.NEW_MESSAGE")
-            addAction("com.example.tasknewcode.NEW_FILE")
-            addAction("com.example.tasknewcode.PROGRESS_UPDATE")
-        }
-        registerReceiver(messageReceiver, intentFilter, RECEIVER_NOT_EXPORTED)
-    }
-
-    private fun loadPreviousMessages() {
-        lifecycleScope.launch {
-            val previousMessages = withContext(Dispatchers.IO) {
-                messageDao.getAllMessages()
-            }
-            messages.addAll(previousMessages)
-            messageAdapter.notifyDataSetChanged()
-            recyclerView.scrollToPosition(messages.size - 1)
-        }
-    }
-
     private fun sendMessage(text: String) {
-        ipAddress?.let { ip ->
-            val message = ChatMessage(
-                ipAddress = ip,
-                text = text,
-                isSender = true,
-                timestamp = System.currentTimeMillis()
-            )
+        val message = ChatMessage(
+            ipAddress = ipAddress,
+            text = text,
+            isSender = true,
+            filePath = null,
+            timestamp = System.currentTimeMillis()
+        )
 
-            lifecycleScope.launch {
-                withContext(Dispatchers.IO) {
-                    messageDao.insertMessage(message)
-                }
+        lifecycleScope.launch(Dispatchers.IO) {
+            messageDao.insertMessage(message)
 
-                withContext(Dispatchers.Main) {
-                    messages.add(message)
-                    messageAdapter.notifyItemInserted(messages.size - 1)
-                    recyclerView.scrollToPosition(messages.size - 1)
+            withContext(Dispatchers.Main) {
+                messages.add(message)
+                messageAdapter.notifyItemInserted(messages.lastIndex)
+                recyclerView.scrollToPosition(messages.lastIndex)
 
-                    // Send the message through network
-                    sender?.sendMessage(text)
-                }
-            }
-        }
-    }
-
-    private fun receiveMessage(text: String) {
-        ipAddress?.let { ip ->
-            val message = ChatMessage(
-                ipAddress = ip,
-                text = text,
-                isSender = false,
-                timestamp = System.currentTimeMillis()
-            )
-
-            lifecycleScope.launch {
-                withContext(Dispatchers.IO) {
-                    messageDao.insertMessage(message)
-                }
-
-                // Update UI after database operation
-                withContext(Dispatchers.Main) {
-                    messages.add(message)
-                    messageAdapter.notifyItemInserted(messages.size - 1)
-                    recyclerView.scrollToPosition(messages.size - 1)
-                }
-            }
-        }
-    }
-
-    private fun receiveFile(filePath: String) {
-        ipAddress?.let { ip ->
-            val fileName = File(filePath).name
-            val message = ChatMessage(
-                ipAddress = ip,
-                text = "📎 Received file: $fileName",
-                isSender = false,
-                timestamp = System.currentTimeMillis(),
-                filePath = filePath  // Make sure this is set
-            )
-
-            lifecycleScope.launch {
-                withContext(Dispatchers.IO) {
-                    messageDao.insertMessage(message)
-                }
-
-                // Update UI after database operation
-                withContext(Dispatchers.Main) {
-                    messages.add(message)
-                    messageAdapter.notifyItemInserted(messages.size - 1)
-                    recyclerView.scrollToPosition(messages.size - 1)
-                }
+//                sender?.(text) {
+//                    runOnUiThread {
+//                        Toast.makeText(
+//                            this@ChatActivity,
+//                            "Failed to send message. Retrying...",
+//                            Toast.LENGTH_SHORT
+//                        ).show()
+//                    }
+//                }
             }
         }
     }
@@ -242,67 +180,171 @@ class ChatActivity : AppCompatActivity() {
         filePicker.launch("*/*")
     }
 
-    private val filePicker = registerForActivityResult(ActivityResultContracts.GetContent()) { uri: Uri? ->
-        uri?.let { fileUri ->
-            val fileName = getFileName(fileUri)
-            val tempMessage = ChatMessage(
-                ipAddress = ipAddress ?: "Unknown",
-                text = "📎 Sending file: $fileName",
-                isSender = true,
-                timestamp = System.currentTimeMillis()
-            )
+//    private val filePicker =
+//        registerForActivityResult(ActivityResultContracts.GetContent()) { uri: Uri? ->
+//            uri?.let { fileUri ->
+//                val fileName = getFileName(fileUri)
+//                val message = ChatMessage(
+//                    ipAddress = ipAddress,
+//                    text = "📎 Sending file: $fileName",
+//                    isSender = true,
+//                    filePath = fileUri.toString(),
+//                    timestamp = System.currentTimeMillis()
+//                )
+//
+//                lifecycleScope.launch(Dispatchers.IO) {
+//                    messageDao.insertMessage(message)
+//
+//                    withContext(Dispatchers.Main) {
+//                        messages.add(message)
+//                        messageAdapter.notifyItemInserted(messages.lastIndex)
+//                        recyclerView.scrollToPosition(messages.lastIndex)
+//                        sender?.sendFile(fileUri)
+//                    }
+//                }
+//            }
+//        }
 
-            lifecycleScope.launch {
-                // First add temporary message
-                withContext(Dispatchers.IO) {
-                    messageDao.insertMessage(tempMessage)
-                }
+    private fun loadPreviousMessages() {
+        lifecycleScope.launch(Dispatchers.IO) {
+            val previousMessages = messageDao.getAllMessages()
 
-                withContext(Dispatchers.Main) {
-                    messages.add(tempMessage)
-                    messageAdapter.notifyItemInserted(messages.size - 1)
-                    recyclerView.scrollToPosition(messages.size - 1)
-
-                    sender?.sendFile(fileUri)
-                }
+            withContext(Dispatchers.Main) {
+                messages.clear()
+                messages.addAll(previousMessages)
+                messageAdapter.notifyDataSetChanged()
+                recyclerView.scrollToPosition(messages.lastIndex)
             }
         }
     }
 
     private fun getFileName(uri: Uri): String {
-        var result: String? = null
-        if (uri.scheme == "content") {
-            contentResolver.query(uri, null, null, null, null)?.use { cursor ->
-                if (cursor.moveToFirst()) {
-                    val nameIndex = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
-                    if (nameIndex != -1) {
-                        result = cursor.getString(nameIndex)
-                    }
-                }
-            }
-        }
-        if (result == null) {
-            result = uri.path
-            val cut = result?.lastIndexOf('/')
-            if (cut != -1) {
-                result = result?.substring(cut!! + 1)
-            }
-        }
-        return result ?: "unknown_file"
-    }
-    private fun updateProgress(progress: Int) {
-        val lastMessage = messages.lastOrNull()
-        if (lastMessage?.text?.startsWith("📎") == true) {
-            lastMessage.text = "${lastMessage.text} ($progress%)"
-            val position = messages.size - 1
-            messageAdapter.notifyItemChanged(position)
-        }
+        return contentResolver.query(uri, null, null, null, null)?.use { cursor ->
+            if (cursor.moveToFirst()) {
+                cursor.getString(cursor.getColumnIndexOrThrow(OpenableColumns.DISPLAY_NAME))
+            } else null
+        } ?: "unknown_file"
     }
 
     override fun onDestroy() {
         super.onDestroy()
-        unregisterReceiver(messageReceiver)
         sender?.disconnect()
         receiver?.stopListening()
     }
+
+    override fun onProgressUpdate(current: Int, total: Int, rate: Long, bufferUsed: Int) {
+        currentFileMessage?.let { message ->
+            if (message.text.startsWith("📎")) {
+                val progress = if (total > 0) (current * 100 / total) else 0
+                val speed = formatSpeed(rate)
+                val buffer = formatSize(bufferUsed.toLong())
+                message.text = "${message.text.split("(")[0]} ($progress% | $speed/s | Buffer: $buffer)"
+                runOnUiThread {
+                    messageAdapter.notifyItemChanged(messages.indexOf(message))
+                }
+            }
+        }
+    }
+
+    override fun onError(message: String) {
+        runOnUiThread {
+            Toast.makeText(this, message, Toast.LENGTH_SHORT).show()
+            currentFileMessage?.let { fileMessage ->
+                fileMessage.text = "${fileMessage.text.split("(")[0]} (Failed: $message)"
+                messageAdapter.notifyItemChanged(messages.indexOf(fileMessage))
+            }
+        }
+    }
+
+    override fun onFileReceived(filePath: String) {
+        val fileName = File(filePath).name
+        val chatMessage = ChatMessage(
+            ipAddress = ipAddress,
+            text = "📎 Received file: $fileName (Completed)",
+            isSender = false,
+            filePath = filePath,
+            timestamp = System.currentTimeMillis()
+        )
+
+        lifecycleScope.launch(Dispatchers.IO) {
+            messageDao.insertMessage(chatMessage)
+
+            withContext(Dispatchers.Main) {
+                messages.add(chatMessage)
+                messageAdapter.notifyItemInserted(messages.lastIndex)
+                recyclerView.scrollToPosition(messages.lastIndex)
+                currentFileMessage = null
+            }
+        }
+    }
+
+    private fun formatSpeed(bytesPerSecond: Long): String {
+        return when {
+            bytesPerSecond >= 1024 * 1024 -> "%.2f MB".format(bytesPerSecond / (1024.0 * 1024.0))
+            bytesPerSecond >= 1024 -> "%.2f KB".format(bytesPerSecond / 1024.0)
+            else -> "$bytesPerSecond B"
+        }
+    }
+
+    private fun formatSize(bytes: Long): String {
+        return when {
+            bytes >= 1024 * 1024 -> "%.2f MB".format(bytes / (1024.0 * 1024.0))
+            bytes >= 1024 -> "%.2f KB".format(bytes / 1024.0)
+            else -> "$bytes B"
+        }
+    }
+
+    private val filePicker =
+        registerForActivityResult(ActivityResultContracts.GetContent()) { uri: Uri? ->
+            uri?.let { fileUri ->
+                val fileName = getFileName(fileUri)
+                val message = ChatMessage(
+                    ipAddress = ipAddress,
+                    text = "📎 Sending file: $fileName",
+                    isSender = true,
+                    filePath = fileUri.toString(),
+                    timestamp = System.currentTimeMillis()
+                )
+
+                lifecycleScope.launch {
+                    withContext(Dispatchers.IO) {
+                        messageDao.insertMessage(message)
+                    }
+
+                    withContext(Dispatchers.Main) {
+                        messages.add(message)
+                        currentFileMessage = message
+                        messageAdapter.notifyItemInserted(messages.lastIndex)
+                        recyclerView.scrollToPosition(messages.lastIndex)
+                    }
+
+                    withContext(Dispatchers.IO) {
+                        sender?.sendFile(fileUri, object : Sender.TransferCallback {
+                            override fun onProgress(progress: Int, speed: Long, bufferUsed: Int) {
+                                lifecycleScope.launch(Dispatchers.Main) {
+                                    onProgressUpdate(progress, 100, speed, bufferUsed)
+                                }
+                            }
+
+                            override fun onComplete(success: Boolean) {
+                                lifecycleScope.launch(Dispatchers.Main) {
+                                    if (success) {
+                                        message.text = "${message.text.split("(")[0]} (Completed)"
+                                    }
+                                    messageAdapter.notifyItemChanged(messages.indexOf(message))
+                                    currentFileMessage = null
+                                }
+                            }
+
+                            override fun onError(errorMessage: String) {
+                                lifecycleScope.launch(Dispatchers.Main) {
+                                    Toast.makeText(this@ChatActivity, "Error: $errorMessage", Toast.LENGTH_SHORT).show()
+                                }
+                            }
+                        })
+                    }
+                }
+            }
+        }
+
 }

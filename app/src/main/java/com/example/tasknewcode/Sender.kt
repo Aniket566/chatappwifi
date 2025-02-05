@@ -1,158 +1,201 @@
 package com.example.tasknewcode
 
-import android.net.Uri
 import android.content.Context
-import android.content.Intent
-import android.provider.OpenableColumns
-import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.launch
+import android.net.Uri
+import android.util.Log
+import kotlinx.coroutines.*
 import java.io.*
 import java.net.Socket
+import java.net.InetSocketAddress
+import java.nio.ByteBuffer
+import kotlin.coroutines.resume
+import kotlin.coroutines.suspendCoroutine
 
 class Sender(private val context: Context) {
     private var socket: Socket? = null
     private var outputStream: DataOutputStream? = null
-    private val scope = CoroutineScope(Dispatchers.IO)
-    private var writer: PrintWriter? = null
-    private var isConnected = false
+    private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+    private val bufferPool = BufferPool(BUFFER_POOL_SIZE)
+    private val averageRateCounter = AverageRateCounter(5)
 
     companion object {
-        private const val MESSAGE_TYPE_TEXT = "TEXT"
-        private const val MESSAGE_TYPE_FILE = "FILE"
-        private const val HEADER_END = "\n"
-        private const val BUFFER_SIZE = 8192
+        private const val PORT = 8888
+        private const val CONNECTION_TIMEOUT = 4000
+        private const val SOCKET_TIMEOUT = 30000
+        private const val BUFFER_POOL_SIZE = 8 * 1024 * 1024
+        private const val TCP_BUFFER_SIZE = 32 * 1024
+        private const val TAG = "WiFiP2PSender"
     }
 
-    fun connect(ip: String, port: Int) {
+    private class BufferPool(poolSize: Int) {
+        private val buffers = ArrayDeque<ByteBuffer>()
+        private val bufferSize = 8192
+
+        init {
+            val numBuffers = poolSize / bufferSize
+            repeat(numBuffers) {
+                buffers.add(ByteBuffer.allocate(bufferSize))
+            }
+        }
+
+        @Synchronized
+        fun acquire(): ByteBuffer {
+            return buffers.removeFirstOrNull() ?: ByteBuffer.allocate(bufferSize)
+        }
+
+        @Synchronized
+        fun release(buffer: ByteBuffer) {
+            buffer.clear()
+            buffers.add(buffer)
+        }
+    }
+
+    private class AverageRateCounter(private val windowSize: Int) {
+        private val rates = ArrayDeque<Long>()
+        private var total: Long = 0
+
+        @Synchronized
+        fun add(bytes: Long) {
+            rates.add(bytes)
+            total += bytes
+            if (rates.size > windowSize) {
+                total -= rates.removeFirst()
+            }
+        }
+
+        fun getRate(): Long = total / windowSize
+    }
+
+    private class TransferProgress(
+        var currentBytes: Long = 0,
+        var totalBytes: Long = 0,
+        var currentFile: String = "",
+        var bufferUsed: Int = 0
+    )
+
+    interface TransferCallback {
+        fun onProgress(progress: Int, speed: Long, bufferUsed: Int)
+        fun onComplete(success: Boolean)
+        fun onError(message: String)
+    }
+
+    fun connect(ipAddress: String, callback: TransferCallback) {
         scope.launch {
             try {
-                if (socket?.isConnected == true) {
-                    println("Already connected, disconnecting first")
-                    disconnect()
+                socket = Socket().apply {
+                    setPerformancePreferences(0, 0, 1)
+                    trafficClass = 0x08
+                    sendBufferSize = TCP_BUFFER_SIZE
+                    soTimeout = SOCKET_TIMEOUT
+                    setSoLinger(true, 0)
+                    tcpNoDelay = true
+                    connect(InetSocketAddress(ipAddress, PORT), CONNECTION_TIMEOUT)
                 }
-
-                println("Connecting to $ip:$port")
-                socket = Socket(ip, port)
-                writer = socket?.getOutputStream()?.let {
-                    PrintWriter(BufferedWriter(OutputStreamWriter(it)), true)
-                }
-
-                if (writer != null) {
-                    isConnected = true
-                    println("Connected successfully to $ip:$port")
-                } else {
-                    println("Failed to create writer")
-                }
+                outputStream = DataOutputStream(BufferedOutputStream(socket?.getOutputStream()))
+                callback.onComplete(true)
+                Log.d(TAG, "Connected to $ipAddress:$PORT")
             } catch (e: Exception) {
-                e.printStackTrace()
-                println("Connection failed: ${e.message}")
-                isConnected = false
+                Log.e(TAG, "Connection failed: ${e.message}")
+                callback.onError("Connection failed: ${e.message}")
+                callback.onComplete(false)
             }
         }
     }
 
-
-    fun sendMessage(message: String) {
-        if (!isConnected) {
-            println("Not connected, cannot send message")
-            return
-        }
-
+    fun sendFile(uri: Uri, callback: TransferCallback) {
         scope.launch {
+            val progress = TransferProgress()
+            val progressJob = startProgressUpdates(progress, callback)
+
             try {
-                println("Attempting to send message: $message")
-                writer?.let { writer ->
-                    writer.println(message)
-                    writer.flush()
-                    println("Message sent successfully")
-                } ?: println("Writer is null, message not sent")
-            } catch (e: Exception) {
-                e.printStackTrace()
-                println("Failed to send message: ${e.message}")
-                isConnected = false
-                reconnect()
-            }
-        }
-    }
-    fun sendFile(fileUri: Uri) {
-        CoroutineScope(Dispatchers.IO).launch {
-            try {
-                val inputStream = context.contentResolver.openInputStream(fileUri)
-                val fileName = getFileName(fileUri)
-                val fileSize = getFileSize(fileUri)
-
-                println("Sending file: $fileName (Size: $fileSize bytes)")
-
-                val header = "$MESSAGE_TYPE_FILE:$fileName:$fileSize$HEADER_END"
-                outputStream?.write(header.toByteArray())
-
-                val buffer = ByteArray(BUFFER_SIZE)
-                var bytesRead = 0
-                var totalSent = 0L
-
-                while (inputStream?.read(buffer).also { bytesRead = it ?: -1 } != -1) {
-                    outputStream?.write(buffer, 0, bytesRead)
-                    totalSent += bytesRead
-
-                    val progress = (totalSent * 100 / fileSize).toInt()
-                    val progressIntent = Intent("com.example.tasknewcode.PROGRESS_UPDATE")
-                    progressIntent.putExtra("progress", progress)
-                    context.sendBroadcast(progressIntent)
-
-                    println("Progress: $totalSent/$fileSize bytes")
+                val fileInfo = getFileInfo(uri)
+                progress.apply {
+                    totalBytes = fileInfo.size
+                    currentFile = fileInfo.name
                 }
+
+                if (socket == null || socket!!.isClosed) {
+                    throw IOException("Socket is closed before sending file")
+                }
+
+                outputStream?.apply {
+                    writeUTF("FILE:${fileInfo.name}")
+                    writeLong(fileInfo.size)
+                    flush()
+                }
+
+                context.contentResolver.openInputStream(uri)?.use { input ->
+                    val buffer = ByteArray(8192)
+                    var bytesRead: Int
+
+                    while (input.read(buffer).also { bytesRead = it } != -1) {
+                        outputStream?.write(buffer, 0, bytesRead)
+                        outputStream?.flush()
+                        progress.currentBytes += bytesRead
+                        progress.bufferUsed = bytesRead
+                    }
+                }
+
                 outputStream?.flush()
-                inputStream?.close()
-
-                println("File sent successfully")
-            } catch (e: Exception) {
-                e.printStackTrace()
-                println("Failed to send file: ${e.message}")
-                reconnect()
+                callback.onComplete(true)
+                Log.d(TAG, "File sent successfully: ${fileInfo.name}")
+            } catch (e: IOException) {
+                Log.e(TAG, "Failed to send file: ${e.message}")
+                callback.onError("Failed to send file: ${e.message}")
+                callback.onComplete(false)
+            } finally {
+                progressJob.cancel()
             }
         }
     }
 
-    private fun getFileName(uri: Uri): String {
-        context.contentResolver.query(uri, null, null, null, null)?.use { cursor ->
-            val nameIndex = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
-            if (cursor.moveToFirst() && nameIndex != -1) {
-                return cursor.getString(nameIndex)
+
+    private fun startProgressUpdates(
+        progress: TransferProgress,
+        callback: TransferCallback
+    ) = scope.launch {
+        while (isActive) {
+            if (progress.totalBytes > 0) {
+                val percentage = ((progress.currentBytes * 100) / progress.totalBytes).toInt()
+                val speed = averageRateCounter.getRate()
+                callback.onProgress(percentage, speed, progress.bufferUsed)
             }
+            delay(1000)
         }
-        return "unknown_file_${System.currentTimeMillis()}"
     }
 
-    private fun getFileSize(uri: Uri): Long {
-        context.contentResolver.query(uri, null, null, null, null)?.use { cursor ->
-            val sizeIndex = cursor.getColumnIndex(OpenableColumns.SIZE)
-            if (cursor.moveToFirst() && sizeIndex != -1) {
-                return cursor.getLong(sizeIndex)
-            }
-        }
-        return -1L
-    }
+    private data class FileInfo(val name: String, val size: Long)
 
-    private fun reconnect() {
-        socket?.let { existingSocket ->
-            connect(existingSocket.inetAddress.hostAddress, existingSocket.port)
-        }
+    private fun getFileInfo(uri: Uri): FileInfo {
+        return context.contentResolver.query(uri, null, null, null, null)?.use { cursor ->
+            if (cursor.moveToFirst()) {
+                val nameIndex = cursor.getColumnIndex("_display_name")
+                val sizeIndex = cursor.getColumnIndex("_size")
+                FileInfo(
+                    name = if (nameIndex != -1) cursor.getString(nameIndex) else "unknown",
+                    size = if (sizeIndex != -1) cursor.getLong(sizeIndex) else 0
+                )
+            } else {
+                FileInfo("unknown", 0)
+            }
+        } ?: FileInfo("unknown", 0)
     }
 
     fun disconnect() {
-        try {
-            isConnected = false
-            writer?.close()
-            socket?.close()
-            writer = null
-            socket = null
-            println("Disconnected and cleaned up resources")
-        } catch (e: Exception) {
-            e.printStackTrace()
-            println("Error during disconnect: ${e.message}")
+        scope.launch {
+            try {
+                outputStream?.close()
+                socket?.apply {
+                    setSoLinger(true, 0)
+                    close()
+                }
+                Log.d(TAG, "Disconnected")
+            } catch (e: Exception) {
+                Log.e(TAG, "Error disconnecting: ${e.message}")
+            } finally {
+                socket = null
+                outputStream = null
+            }
         }
     }
-
-    fun isConnected(): Boolean = isConnected
 }
